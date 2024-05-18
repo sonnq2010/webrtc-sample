@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Title</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+    <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.5.1/jquery.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/popper.js/1.16.0/umd/popper.min.js"></script>
+    <script src="https://maxcdn.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.min.js"></script>
+    <style>
+        #messages {
+
+        }
+        #messages li {
+            margin-top: 4px;
+        }
+        #controls {
+            margin: 20px;
+        }
+
+        video {
+            object-fit: fill;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="container-fluid">
+        <h1>One two One WebRTC Video Call</h1>
+        <p>Ví dụ này chỉ hỗ trợ gọi 1-1, đầu bên kia có thể là web client, hoặc flutter app đều được, miễn là có kết nối đến ws server này và follow theo message rule của socket là được.</p>
+        <p>Sau khi webcam đã được mở thì bên nào thực hiện gọi điện cũng được, bên receiver sẽ tự động kết nối</p>
+        <p>Có một điểm cần lưu ý trong client code là</p>
+        <ul>
+            <li>Chỗ câu lệnh <code>peerConnection.addTrack(track, localMedia); </code> phải có sự tham gia của biến <code>localMedia</code> nếu không flutter client không hoạt động được</li>
+            <li>Web client thì không cần vì nó có thể tự khởi tạo <code>MediaStream()</code></li>
+            <li>Còn flutter client thì <code>MediaStream</code> là một abstract class nên nó không thể tự khởi tạo được</li>
+            <li>Khi truyền thiếu tham số <code>localMedia</code> thì phía flutter chỉ nhận được các <code>track</code> chứ không nhận được <code>MediaStream</code> khiển cho việc render không thể thực hiện được</li>
+        </ul>
+        <div id="controls">
+            <button id="callBtn" disabled>Gọi điện</button>
+        </div>
+        <div id="display" class="row">
+            <video class="col" autoplay playsinline id="myVideo"></video>
+            <video  class="col" autoplay playsinline id="peerVideo"></video>
+        </div>
+        <ul id="messages">
+
+        </ul>
+    </div>
+
+    <script>
+        window.onload = startup;
+
+        let socket;
+        let localMedia;
+        let messageList;
+
+        let peerConnection;
+        let callBtn;
+        let myVideo, peerVideo;
+
+        async function openWebcam() {
+            navigator.getUserMedia = navigator.getUserMedia || navigator.webkitGetUserMedia
+                || navigator.mozGetUserMedia;
+            try {
+                localMedia = await navigator.mediaDevices.getUserMedia({video:true, audio: {
+                        echoCancellation: true
+                    }})
+                myVideo.srcObject = localMedia
+                myVideo.muted = true
+                initPeer()
+            }catch (e) {
+                displayMessage(`Không thể kết nối đến webcam: ${e.message}`)
+            }
+        }
+
+        function initPeer() {
+            const configuration = {'iceServers': [{'urls': 'stun:stun.l.google.com:19302'}]}
+            peerConnection = new RTCPeerConnection(configuration);
+            displayMessage('Peer đã được khởi tạo')
+
+            peerConnection.onicecandidate = e => {
+                let candidate = e.candidate
+                if (candidate) {
+                    sendMessage({type: 'candidate', data: candidate, from: socket.id})
+                    displayMessage('Đã resolve được 1 ice candidate và đã gửi đi')
+                    console.log(candidate)
+                }
+                else {
+                    displayMessage('Đã resolve được 1 NULL ice candidate nên bỏ qua')
+                }
+            }
+
+            peerConnection.onconnectionstatechange = e => {
+                if (peerConnection.connectionState === 'connected') {
+                    displayMessage('Đã kết nối thành công với peer', true, true)
+                }
+            }
+
+            let remoteMediaStream = new MediaStream()
+            peerVideo.srcObject = remoteMediaStream
+            peerConnection.ontrack = async (e) => {
+                let track = e.track
+                displayMessage(`Đã nhận được media track từ phía peer: ${track.label} - ${track.kind}`)
+                remoteMediaStream.addTrack(track)
+            }
+
+            localMedia.getTracks().forEach(track => {
+                if (track.kind === 'audio') {
+                    console.log('mute audio')
+                }
+               peerConnection.addTrack(track, localMedia); // ok
+               displayMessage(`Thêm track ${track.label} - ${track.kind} vào peerConnection`)
+            });
+
+            callBtn.disabled = false
+        }
+
+        async function handleIncomingCandidate(data) {
+            let candidate = data.data
+            let from = data.from
+
+            try {
+                await peerConnection.addIceCandidate(candidate);
+                displayMessage(`Đã nhận candidate từ ${from} và đã thiết lập nó.`)
+                console.log(candidate)
+            }catch (e) {
+                displayMessage(`Đã nhận một candidate nhưng thiết lập thất bại: ${e.message}`)
+                console.log(candidate)
+            }
+        }
+
+        async function makeCall() {
+            const offer = await peerConnection.createOffer();
+            await peerConnection.setLocalDescription(offer);
+            sendMessage({type: 'offer', data: offer, from: socket.id});
+            displayMessage(`Offer đã được tạo, đã thiết lập ở local và đã được gửi đi`)
+            console.log(offer);
+        }
+
+        async function handleOffer(data) {
+            let offer = data.data
+            let from = data.from
+
+            const remoteDesc = new RTCSessionDescription(offer);
+            await peerConnection.setRemoteDescription(remoteDesc);
+
+            displayMessage(`Đã nhận được offer từ: ${from} và thiết lập nó làm remote description`)
+            console.log(offer)
+
+            const answer = await peerConnection.createAnswer();
+            await peerConnection.setLocalDescription(answer);
+
+            displayMessage(`Answer đã được tạo, đã thiết lập ở local và đã được gửi đi`)
+            sendMessage({type: 'answer', data: answer, from: socket.id});
+
+            callBtn.disabled = true
+            console.log(answer);
+        }
+
+        async function handlerAnswer(data) {
+            let answer = data.data
+            let from = data.from
+
+            const remoteDesc = new RTCSessionDescription(answer);
+            await peerConnection.setRemoteDescription(remoteDesc);
+
+            displayMessage(`Đã nhận được answer từ: ${from} và thiết lập nó làm remote description`)
+            console.log(answer);
+
+            callBtn.disabled = true
+        }
+
+        async function startup() {
+            messageList = document.getElementById('messages')
+            callBtn = document.getElementById('callBtn');
+            myVideo = document.getElementById('myVideo')
+            peerVideo = document.getElementById('peerVideo')
+
+            callBtn.addEventListener('click', makeCall);
+            
+
+            await openWebcam();
+
+            const host = location.origin.replace(/^http/, 'ws')
+            socket = new WebSocket(host)
+
+            socket.onerror = handleError
+            socket.onclose = handleClose
+            socket.onopen = handleOpen
+            socket.onmessage = handleMessage
+        }
+
+        function handleError(e) {
+            displayMessage('Đã xảy ra lỗi: ' + e.message)
+        }
+
+        function handleClose() {
+            displayMessage('Connection đã bị đóng')
+        }
+
+        function handleOpen() {
+            displayMessage('Đã kết nối tới websocket server')
+        }
+
+        function handleMessage(message) {
+            let data = JSON.parse(message.data)
+            console.log(`Message mới: ${JSON.stringify(data)}`)
+
+            if (data.type === 'id') {
+                socket.id = data.data
+                displayMessage('Đã được server gán id là: ' + socket.id)
+                document.title = socket.id
+            }
+            else if (data.type === 'text') {
+                displayMessage(data.data, false)
+            }
+            else if (data.type === 'text-important') {
+                displayMessage(data.data, false, true)
+            }
+            else if (data.type === 'offer') {
+                handleOffer(data)
+            }
+            else if (data.type === 'answer') {
+                handlerAnswer(data)
+            }
+            else if (data.type === 'candidate') {
+                handleIncomingCandidate(data)
+            }
+        }
+
+        function sendMessage(data) {
+            if (socket) {
+                socket.send(JSON.stringify(data))
+            }else {
+                console.log('Không thể gửi tin nhắn vì chưa kết nối tới websocket server')
+            }
+        }
+
+        function sendTextMessage(text) {
+            sendMessage({type: 'text', data: text})
+        }
+
+        function displayMessage(text, log = true, important = false) {
+            let li = document.createElement('li')
+            if (important) {
+                li.innerHTML = `<b>${text}</b>`;
+            }
+            else {
+                li.innerHTML = text
+            }
+            messageList.appendChild(li)
+
+            if (log) {
+                console.log(text)
+            }
+        }
+    </script>
+</body>
+</html>
